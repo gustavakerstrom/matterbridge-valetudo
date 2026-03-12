@@ -16,7 +16,16 @@ import { RvcCleanMode, RvcOperationalState, RvcRunMode } from 'matterbridge/matt
 // import resolution issues across different npm dependency tree layouts.
 type PlatformMatterbridge = ConstructorParameters<typeof MatterbridgeDynamicPlatform>[0];
 
-import { BatteryStateAttribute, CachedMapLayers, ConsumableProperties, PresetLevel, ValetudoClient, ValetudoConsumable, ValetudoOperationMode } from './valetudo-client.js';
+import {
+  BatteryStateAttribute,
+  CachedMapLayers,
+  ConsumableProperties,
+  PresetLevel,
+  ValetudoClient,
+  ValetudoConsumable,
+  ValetudoHttpClient,
+  ValetudoOperationMode,
+} from './valetudo-client.js';
 import { ValetudoDiscovery } from './valetudo-discovery.js';
 
 /**
@@ -227,7 +236,7 @@ export class ValetudoPlatform extends MatterbridgeDynamicPlatform {
     this.log.info(`Adding vacuum from ${source}: ${ip}${customName ? ` (${customName})` : ''}`);
 
     // Create Valetudo client
-    const client = new ValetudoClient(ip, this.log, username, password);
+    const client = new ValetudoHttpClient(ip, this.log, username, password);
 
     // Test connection
     const isConnected = await client.testConnection();

@@ -189,17 +189,186 @@ export interface MapPositionData {
 }
 
 // ============================================================================
-// Valetudo Client
+// Abstract Valetudo Client
 // ============================================================================
 
-export class ValetudoClient {
+export abstract class ValetudoClient {
+  protected log: AnsiLogger;
+
+  constructor(log: AnsiLogger) {
+    this.log = log;
+  }
+
+  // ==========================================================================
+  // General Information
+  // ==========================================================================
+  abstract getInfo(): Promise<ValetudoInfo | null>;
+  abstract getCustomizations(): Promise<ValetudoCustomizations | null>;
+  abstract getRobotInfo(): Promise<ValetudoRobotInfo | null>;
+  abstract getCapabilities(): Promise<string[] | null>;
+
+  // ==========================================================================
+  // State Monitoring
+  // ==========================================================================
+  abstract getStateAttributes(): Promise<StateAttribute[] | null>;
+
+  // ==========================================================================
+  // Basic Control
+  // ==========================================================================
+  abstract executeBasicControl(action: 'start' | 'stop' | 'pause' | 'home'): Promise<boolean>;
+
+  /**
+   * Start cleaning
+   */
+  async start(): Promise<boolean> {
+    return this.executeBasicControl('start');
+  }
+
+  /**
+   * Stop cleaning
+   */
+  async stop(): Promise<boolean> {
+    return this.executeBasicControl('stop');
+  }
+
+  /**
+   * Pause cleaning
+   */
+  async pause(): Promise<boolean> {
+    return this.executeBasicControl('pause');
+  }
+
+  /**
+   * Return to dock
+   */
+  async home(): Promise<boolean> {
+    return this.executeBasicControl('home');
+  }
+  /**
+   * Start cleaning (alias for start)
+   */
+  async startCleaning(): Promise<boolean> {
+    return this.start();
+  }
+  /**
+   * Stop cleaning (alias for stop)
+   */
+  async stopCleaning(): Promise<boolean> {
+    return this.stop();
+  }
+  /**
+   * Pause cleaning (alias for pause)
+   */
+  async pauseCleaning(): Promise<boolean> {
+    return this.pause();
+  }
+  /**
+   * Return home (alias for home)
+   */
+  async returnHome(): Promise<boolean> {
+    return this.home();
+  }
+
+  // ==========================================================================
+  // Preset Controls
+  // ==========================================================================
+  abstract getFanSpeedPresets(): Promise<PresetLevel[] | null>;
+  abstract setFanSpeed(preset: PresetLevel): Promise<boolean>;
+  abstract getWaterUsagePresets(): Promise<PresetLevel[] | null>;
+  abstract setWaterUsage(preset: PresetLevel): Promise<boolean>;
+  abstract getOperationModePresets(): Promise<ValetudoOperationMode[] | null>;
+  abstract setOperationMode(preset: ValetudoOperationMode): Promise<boolean>;
+  abstract getMapSegments(): Promise<MapSegment[] | null>;
+  abstract getMapSegmentationProperties(): Promise<MapSegmentationProperties | null>;
+  abstract cleanSegments(segmentIds: string[], iterations: number, customOrder: boolean): Promise<boolean>;
+  abstract getMapDataWithTimeout(timeoutMs: number): Promise<MapData | null>;
+  abstract getMapPositionData(): Promise<MapPositionData | null>;
+
+  /**
+   * Find which segment contains a given point using cached layers
+   * This is a static method that works with cached data
+   *
+   * @param cachedLayers - Cached map layers
+   * @param x - X coordinate
+   * @param y - Y coordinate
+   * @returns The segment layer containing the point, or null if not found
+   */
+  findSegmentAtPositionCached(cachedLayers: CachedMapLayers, x: number, y: number): MapLayer | null {
+    const segments = cachedLayers.layers.filter((layer) => layer.type === 'segment');
+
+    // Find all segments whose bounds contain this position
+    const matchingSegments: Array<{ segment: MapLayer; distance: number }> = [];
+
+    for (const segment of segments) {
+      const dims = segment.dimensions;
+      const inBounds = x >= dims.x.min && x <= dims.x.max && y >= dims.y.min && y <= dims.y.max;
+
+      if (inBounds) {
+        // Calculate distance from segment midpoint
+        const distanceFromMid = Math.sqrt(Math.pow(x - dims.x.mid, 2) + Math.pow(y - dims.y.mid, 2));
+        matchingSegments.push({ segment, distance: distanceFromMid });
+      }
+    }
+
+    if (matchingSegments.length === 0) {
+      return null;
+    }
+
+    if (matchingSegments.length === 1) {
+      return matchingSegments[0].segment;
+    }
+
+    // Multiple segments contain this position - use closest midpoint
+    matchingSegments.sort((a, b) => a.distance - b.distance);
+    const closest = matchingSegments[0];
+    this.log.debug(`Multiple segments at (${x}, ${y}) - selected "${closest.segment.metaData.segmentId}" (closest midpoint, distance: ${closest.distance.toFixed(1)})`);
+
+    return closest.segment;
+  }
+
+  /**
+   * Create cached layers from full map data
+   *
+   * @param mapData - Full map data from Valetudo
+   * @returns Cached layers suitable for position tracking
+   */
+  createCachedLayers(mapData: MapData): CachedMapLayers {
+    return {
+      layers: mapData.layers,
+      size: mapData.size,
+      pixelSize: mapData.pixelSize,
+      timestamp: Date.now(),
+      version: mapData.metaData.version,
+    };
+  }
+
+  // ==========================================================================
+  // Additional Features
+  // ==========================================================================
+  abstract locate(): Promise<boolean>;
+  abstract getConsumables(): Promise<ValetudoConsumable[] | null>;
+  abstract getConsumablesProperties(): Promise<ConsumableProperties[] | null>;
+
+  /**
+   * Test connection to Valetudo
+   */
+  async testConnection(): Promise<boolean> {
+    const info = await this.getInfo();
+    return info !== null;
+  }
+}
+
+// ============================================================================
+// HTTP Valetudo Client
+// ============================================================================
+
+export class ValetudoHttpClient extends ValetudoClient {
   private baseUrl: string;
-  private log: AnsiLogger;
   private authHeader: string | null = null;
 
   constructor(ip: string, log: AnsiLogger, username?: string, password?: string) {
+    super(log);
     this.baseUrl = `http://${ip}`;
-    this.log = log;
 
     // Pre-compute Base64 Authorization header if credentials are provided
     if (username && password) {
@@ -302,62 +471,6 @@ export class ValetudoClient {
       this.log.error(`Error executing basic control (${action}): ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-  }
-
-  /**
-   * Start cleaning
-   */
-  async start(): Promise<boolean> {
-    return this.executeBasicControl('start');
-  }
-
-  /**
-   * Stop cleaning
-   */
-  async stop(): Promise<boolean> {
-    return this.executeBasicControl('stop');
-  }
-
-  /**
-   * Pause cleaning
-   */
-  async pause(): Promise<boolean> {
-    return this.executeBasicControl('pause');
-  }
-
-  /**
-   * Return to dock
-   */
-  async home(): Promise<boolean> {
-    return this.executeBasicControl('home');
-  }
-
-  /**
-   * Start cleaning (alias for start)
-   */
-  async startCleaning(): Promise<boolean> {
-    return this.start();
-  }
-
-  /**
-   * Stop cleaning (alias for stop)
-   */
-  async stopCleaning(): Promise<boolean> {
-    return this.stop();
-  }
-
-  /**
-   * Pause cleaning (alias for pause)
-   */
-  async pauseCleaning(): Promise<boolean> {
-    return this.pause();
-  }
-
-  /**
-   * Return home (alias for home)
-   */
-  async returnHome(): Promise<boolean> {
-    return this.home();
   }
 
   // ==========================================================================
@@ -545,64 +658,6 @@ export class ValetudoClient {
       this.log.error(`Error fetching position data: ${error instanceof Error ? error.message : String(error)}`);
       return null;
     }
-  }
-
-  /**
-   * Find which segment contains a given point using cached layers
-   * This is a static method that works with cached data
-   *
-   * @param cachedLayers - Cached map layers
-   * @param x - X coordinate
-   * @param y - Y coordinate
-   * @returns The segment layer containing the point, or null if not found
-   */
-  findSegmentAtPositionCached(cachedLayers: CachedMapLayers, x: number, y: number): MapLayer | null {
-    const segments = cachedLayers.layers.filter((layer) => layer.type === 'segment');
-
-    // Find all segments whose bounds contain this position
-    const matchingSegments: Array<{ segment: MapLayer; distance: number }> = [];
-
-    for (const segment of segments) {
-      const dims = segment.dimensions;
-      const inBounds = x >= dims.x.min && x <= dims.x.max && y >= dims.y.min && y <= dims.y.max;
-
-      if (inBounds) {
-        // Calculate distance from segment midpoint
-        const distanceFromMid = Math.sqrt(Math.pow(x - dims.x.mid, 2) + Math.pow(y - dims.y.mid, 2));
-        matchingSegments.push({ segment, distance: distanceFromMid });
-      }
-    }
-
-    if (matchingSegments.length === 0) {
-      return null;
-    }
-
-    if (matchingSegments.length === 1) {
-      return matchingSegments[0].segment;
-    }
-
-    // Multiple segments contain this position - use closest midpoint
-    matchingSegments.sort((a, b) => a.distance - b.distance);
-    const closest = matchingSegments[0];
-    this.log.debug(`Multiple segments at (${x}, ${y}) - selected "${closest.segment.metaData.segmentId}" (closest midpoint, distance: ${closest.distance.toFixed(1)})`);
-
-    return closest.segment;
-  }
-
-  /**
-   * Create cached layers from full map data
-   *
-   * @param mapData - Full map data from Valetudo
-   * @returns Cached layers suitable for position tracking
-   */
-  createCachedLayers(mapData: MapData): CachedMapLayers {
-    return {
-      layers: mapData.layers,
-      size: mapData.size,
-      pixelSize: mapData.pixelSize,
-      timestamp: Date.now(),
-      version: mapData.metaData.version,
-    };
   }
 
   // ==========================================================================
@@ -806,13 +861,5 @@ export class ValetudoClient {
       req.write(bodyString);
       req.end();
     });
-  }
-
-  /**
-   * Test connection to Valetudo
-   */
-  async testConnection(): Promise<boolean> {
-    const info = await this.getInfo();
-    return info !== null;
   }
 }
