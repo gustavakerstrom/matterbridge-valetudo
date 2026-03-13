@@ -8,24 +8,25 @@
 import * as http from 'node:http';
 
 import { AnsiLogger } from 'matterbridge/logger';
+import mqtt from 'mqtt';
 
 // ============================================================================
 // Type Definitions
 // ============================================================================
 
 export interface ValetudoInfo {
-  embedded: boolean;
+  embedded?: boolean;
   systemId: string;
-  welcomeDialogDismissed: boolean;
+  welcomeDialogDismissed?: boolean;
 }
 
 export interface ValetudoRobotInfo {
   manufacturer: string;
   modelName: string;
-  modelDetails: {
+  modelDetails?: {
     supportedAttachments: ('dustbin' | 'watertank' | 'mop')[];
   };
-  implementation: string;
+  implementation?: string;
 }
 
 export interface ValetudoCustomizations {
@@ -39,6 +40,8 @@ export type PresetLevel = 'off' | 'min' | 'low' | 'medium' | 'high' | 'max' | 't
 export type ValetudoOperationMode = 'vacuum' | 'mop' | 'vacuum_and_mop' | 'vacuum_then_mop';
 export type PresetValue = PresetLevel | ValetudoOperationMode;
 export type ConsumableUnit = 'percent' | 'minutes';
+export type StatusStateAttributeValue = 'error' | 'docked' | 'idle' | 'returning' | 'cleaning' | 'paused' | 'manual_control' | 'moving';
+export type StatusStateAttributeFlag = 'none' | 'zone' | 'segment' | 'spot' | 'target' | 'resumable' | 'mapping';
 
 export interface BatteryStateAttribute {
   __class: 'BatteryStateAttribute';
@@ -63,8 +66,9 @@ export interface PresetSelectionStateAttribute {
 export interface StatusStateAttribute {
   __class: 'StatusStateAttribute';
   type: 'StatusStateAttribute';
-  value: string;
-  flag?: string;
+  value: StatusStateAttributeValue;
+  flag?: StatusStateAttributeFlag;
+  error?: { description: string };
 }
 
 export interface DockStatusStateAttribute {
@@ -76,6 +80,7 @@ export interface DockStatusStateAttribute {
 export type StateAttribute = BatteryStateAttribute | AttachmentStateAttribute | PresetSelectionStateAttribute | StatusStateAttribute | DockStatusStateAttribute;
 
 export interface MapSegment {
+  __class: 'ValetudoMapSegment';
   id: string;
   name: string;
   metaData: Record<string, unknown>;
@@ -198,6 +203,9 @@ export abstract class ValetudoClient {
   constructor(log: AnsiLogger) {
     this.log = log;
   }
+
+  abstract connect(): Promise<boolean>;
+  abstract disconnect(): Promise<void>;
 
   // ==========================================================================
   // General Information
@@ -376,6 +384,14 @@ export class ValetudoHttpClient extends ValetudoClient {
     }
   }
 
+  override async connect(): Promise<boolean> {
+    return this.testConnection();
+  }
+
+  override async disconnect(): Promise<void> {
+    return;
+  }
+
   // ==========================================================================
   // General Information
   // ==========================================================================
@@ -383,7 +399,7 @@ export class ValetudoHttpClient extends ValetudoClient {
   /**
    * Fetch basic Valetudo information
    */
-  async getInfo(): Promise<ValetudoInfo | null> {
+  override async getInfo(): Promise<ValetudoInfo | null> {
     try {
       const url = `${this.baseUrl}/api/v2/valetudo`;
       this.log.debug(`Fetching Valetudo info from: ${url}`);
@@ -412,7 +428,7 @@ export class ValetudoHttpClient extends ValetudoClient {
   /**
    * Get robot information
    */
-  async getRobotInfo(): Promise<ValetudoRobotInfo | null> {
+  override async getRobotInfo(): Promise<ValetudoRobotInfo | null> {
     try {
       const data = await this.httpGet(`${this.baseUrl}/api/v2/robot`);
       return data as ValetudoRobotInfo;
@@ -425,7 +441,7 @@ export class ValetudoHttpClient extends ValetudoClient {
   /**
    * Get supported capabilities
    */
-  async getCapabilities(): Promise<string[] | null> {
+  override async getCapabilities(): Promise<string[] | null> {
     try {
       const data = await this.httpGet(`${this.baseUrl}/api/v2/robot/capabilities`);
       return data as string[];
@@ -442,7 +458,7 @@ export class ValetudoHttpClient extends ValetudoClient {
   /**
    * Get robot state attributes (battery, attachments, presets)
    */
-  async getStateAttributes(): Promise<StateAttribute[] | null> {
+  override async getStateAttributes(): Promise<StateAttribute[] | null> {
     try {
       const data = await this.httpGet(`${this.baseUrl}/api/v2/robot/state/attributes`);
       return data as StateAttribute[];
@@ -461,7 +477,7 @@ export class ValetudoHttpClient extends ValetudoClient {
    *
    * @param action
    */
-  async executeBasicControl(action: 'start' | 'stop' | 'pause' | 'home'): Promise<boolean> {
+  override async executeBasicControl(action: 'start' | 'stop' | 'pause' | 'home'): Promise<boolean> {
     try {
       const result = await this.httpPut(`${this.baseUrl}/api/v2/robot/capabilities/BasicControlCapability`, {
         action,
@@ -480,7 +496,7 @@ export class ValetudoHttpClient extends ValetudoClient {
   /**
    * Get available fan speed presets
    */
-  async getFanSpeedPresets(): Promise<PresetLevel[] | null> {
+  override async getFanSpeedPresets(): Promise<PresetLevel[] | null> {
     try {
       const data = await this.httpGet(`${this.baseUrl}/api/v2/robot/capabilities/FanSpeedControlCapability/presets`);
       return data as PresetLevel[];
@@ -495,7 +511,7 @@ export class ValetudoHttpClient extends ValetudoClient {
    *
    * @param preset
    */
-  async setFanSpeed(preset: PresetLevel): Promise<boolean> {
+  override async setFanSpeed(preset: PresetLevel): Promise<boolean> {
     try {
       const result = await this.httpPut(`${this.baseUrl}/api/v2/robot/capabilities/FanSpeedControlCapability/preset`, {
         name: preset,
@@ -510,7 +526,7 @@ export class ValetudoHttpClient extends ValetudoClient {
   /**
    * Get available water usage presets
    */
-  async getWaterUsagePresets(): Promise<PresetLevel[] | null> {
+  override async getWaterUsagePresets(): Promise<PresetLevel[] | null> {
     try {
       const data = await this.httpGet(`${this.baseUrl}/api/v2/robot/capabilities/WaterUsageControlCapability/presets`);
       return data as PresetLevel[];
@@ -525,7 +541,7 @@ export class ValetudoHttpClient extends ValetudoClient {
    *
    * @param preset
    */
-  async setWaterUsage(preset: PresetLevel): Promise<boolean> {
+  override async setWaterUsage(preset: PresetLevel): Promise<boolean> {
     try {
       const result = await this.httpPut(`${this.baseUrl}/api/v2/robot/capabilities/WaterUsageControlCapability/preset`, {
         name: preset,
@@ -540,7 +556,7 @@ export class ValetudoHttpClient extends ValetudoClient {
   /**
    * Get available operation mode presets
    */
-  async getOperationModePresets(): Promise<ValetudoOperationMode[] | null> {
+  override async getOperationModePresets(): Promise<ValetudoOperationMode[] | null> {
     try {
       const data = await this.httpGet(`${this.baseUrl}/api/v2/robot/capabilities/OperationModeControlCapability/presets`);
       return data as ValetudoOperationMode[];
@@ -555,7 +571,7 @@ export class ValetudoHttpClient extends ValetudoClient {
    *
    * @param preset
    */
-  async setOperationMode(preset: ValetudoOperationMode): Promise<boolean> {
+  override async setOperationMode(preset: ValetudoOperationMode): Promise<boolean> {
     try {
       const result = await this.httpPut(`${this.baseUrl}/api/v2/robot/capabilities/OperationModeControlCapability/preset`, {
         name: preset,
@@ -574,7 +590,7 @@ export class ValetudoHttpClient extends ValetudoClient {
   /**
    * Get available map segments (rooms)
    */
-  async getMapSegments(): Promise<MapSegment[] | null> {
+  override async getMapSegments(): Promise<MapSegment[] | null> {
     try {
       const data = await this.httpGet(`${this.baseUrl}/api/v2/robot/capabilities/MapSegmentationCapability`);
       return data as MapSegment[];
@@ -587,7 +603,7 @@ export class ValetudoHttpClient extends ValetudoClient {
   /**
    * Get map segmentation properties (iteration support, custom order support)
    */
-  async getMapSegmentationProperties(): Promise<MapSegmentationProperties | null> {
+  override async getMapSegmentationProperties(): Promise<MapSegmentationProperties | null> {
     try {
       const data = await this.httpGet(`${this.baseUrl}/api/v2/robot/capabilities/MapSegmentationCapability/properties`);
       return data as MapSegmentationProperties;
@@ -604,7 +620,7 @@ export class ValetudoHttpClient extends ValetudoClient {
    * @param iterations
    * @param customOrder
    */
-  async cleanSegments(segmentIds: string[], iterations = 1, customOrder = false): Promise<boolean> {
+  override async cleanSegments(segmentIds: string[], iterations = 1, customOrder = false): Promise<boolean> {
     try {
       const payload = {
         action: 'start_segment_action',
@@ -628,7 +644,7 @@ export class ValetudoHttpClient extends ValetudoClient {
    * @param timeoutMs - Timeout in milliseconds
    * @returns Map data or null if fetch fails
    */
-  async getMapDataWithTimeout(timeoutMs: number): Promise<MapData | null> {
+  override async getMapDataWithTimeout(timeoutMs: number): Promise<MapData | null> {
     try {
       const data = await this.httpGet(`${this.baseUrl}/api/v2/robot/state/map`, timeoutMs);
       return data as MapData;
@@ -644,7 +660,7 @@ export class ValetudoHttpClient extends ValetudoClient {
    *
    * @returns Position data with entities and metadata version
    */
-  async getMapPositionData(): Promise<MapPositionData | null> {
+  override async getMapPositionData(): Promise<MapPositionData | null> {
     try {
       const data = await this.httpGet(`${this.baseUrl}/api/v2/robot/state/map`);
       const mapData = data as MapData;
@@ -667,7 +683,7 @@ export class ValetudoHttpClient extends ValetudoClient {
   /**
    * Locate robot (play sound)
    */
-  async locate(): Promise<boolean> {
+  override async locate(): Promise<boolean> {
     try {
       const result = await this.httpPut(`${this.baseUrl}/api/v2/robot/capabilities/LocateCapability`, {
         action: 'locate',
@@ -682,7 +698,7 @@ export class ValetudoHttpClient extends ValetudoClient {
   /**
    * Get consumables status (brush, filter, etc.)
    */
-  async getConsumables(): Promise<ValetudoConsumable[] | null> {
+  override async getConsumables(): Promise<ValetudoConsumable[] | null> {
     try {
       const data = await this.httpGet(`${this.baseUrl}/api/v2/robot/capabilities/ConsumableMonitoringCapability`);
       return data as ValetudoConsumable[];
@@ -695,7 +711,7 @@ export class ValetudoHttpClient extends ValetudoClient {
   /**
    * Get consumables properties (max lifetime etc.)
    */
-  async getConsumablesProperties(): Promise<ConsumableProperties[] | null> {
+  override async getConsumablesProperties(): Promise<ConsumableProperties[] | null> {
     try {
       const data = (await this.httpGet(`${this.baseUrl}/api/v2/robot/capabilities/ConsumableMonitoringCapability/properties`)) as { availableConsumables: ConsumableProperties[] };
       return data.availableConsumables;
@@ -860,6 +876,277 @@ export class ValetudoHttpClient extends ValetudoClient {
 
       req.write(bodyString);
       req.end();
+    });
+  }
+}
+
+// ============================================================================
+// MQTT Valetudo Client
+// ============================================================================
+interface HomieProperty {
+  $name?: string;
+  $datatype?: string;
+  $format?: string;
+  $settable?: string;
+  $retained?: boolean;
+  $unit?: string;
+  value?: string;
+}
+
+interface HomieNode {
+  $name?: string;
+  $type?: string;
+  $properties?: string;
+  properties: Record<string, HomieProperty>;
+}
+
+// All of these are actually mandatory but we add them one message at a time
+interface HomieDevice {
+  $homie?: string;
+  $name?: string;
+  $state?: string;
+  $implementation?: string;
+  $nodes?: string;
+  nodes: Record<string, HomieNode>;
+}
+
+export class ValetudoMQTTClient extends ValetudoClient {
+  private client?: mqtt.MqttClient;
+  private topicPrefix: string;
+
+  private homieDevice: HomieDevice = { nodes: {} };
+
+  private brokerUrl: string;
+
+  private options: mqtt.IClientOptions = {
+    keepalive: 60,
+    protocolVersion: 5,
+    reconnectPeriod: 5000,
+    connectTimeout: 60 * 1000,
+    username: undefined,
+    password: undefined,
+  };
+
+  constructor(log: AnsiLogger, host: string, port: number, topicPrefix: string, username?: string, password?: string, rejectUnauthorized?: boolean) {
+    super(log);
+
+    this.topicPrefix = topicPrefix;
+    if (!host.startsWith('mqtt://')) {
+      throw new Error(`Invalid mqtt host: ${host}`);
+    }
+
+    this.options.username = username !== undefined && username !== '' ? username : undefined;
+    this.options.password = password !== undefined && password !== '' ? password : undefined;
+    this.options.rejectUnauthorized = rejectUnauthorized;
+
+    this.brokerUrl = `${host}:${port}`;
+  }
+
+  override async connect(): Promise<boolean> {
+    return new Promise((resolve) => {
+      this.client = mqtt.connect(this.brokerUrl, this.options);
+
+      this.client.on('connect', () => {
+        this.log.info(`Connected to MQTT Broker at ${this.brokerUrl}. Subscribing to ${this.topicPrefix}/#`);
+        this.client?.subscribe(`${this.topicPrefix}/#`);
+        resolve(true);
+      });
+
+      this.client.on('message', (topic, payload) => {
+        this.log.debug(`Received message from ${topic}`);
+
+        this.parseHomieTopic(topic, payload.toString());
+      });
+    });
+  }
+
+  override async disconnect(): Promise<void> {
+    this.client?.end();
+  }
+
+  private parseHomieTopic(topic: string, payload: string) {
+    const path = topic.substring(this.topicPrefix.length + 1);
+    const parts = path.split('/');
+
+    if (parts.length === 1 && parts[0].startsWith('$')) {
+      const attr = parts[0] as keyof HomieDevice;
+      (this.homieDevice[attr] as string) = payload;
+      return;
+    }
+    const nodeId = parts[0];
+    const propertyId = parts.length > 1 ? parts[1] : null;
+    const attributeId = parts.length > 2 ? parts[2] : null;
+
+    if (!this.homieDevice.nodes[nodeId]) {
+      this.homieDevice.nodes[nodeId] = { properties: {} };
+    }
+    const node = this.homieDevice.nodes[nodeId];
+
+    if (propertyId && propertyId.startsWith('$')) {
+      const attr = propertyId as keyof HomieNode;
+      (node[attr] as string) = payload;
+      return;
+    }
+
+    if (propertyId) {
+      if (!node.properties[propertyId]) {
+        node.properties[propertyId] = {};
+      }
+      const property = node.properties[propertyId];
+
+      if (attributeId && attributeId.startsWith('$')) {
+        const attr = attributeId as keyof HomieProperty;
+        (property[attr] as string) = payload;
+      } else if (!attributeId) {
+        property.value = payload;
+      }
+    }
+  }
+
+  override async testConnection(): Promise<boolean> {
+    this.log.debug(`state: ${this.homieDevice.$state}`);
+    return this.homieDevice.$state === 'ready';
+  }
+
+  override async getInfo(): Promise<ValetudoInfo | null> {
+    return { systemId: this.topicPrefix } as ValetudoInfo;
+  }
+  override async getCustomizations(): Promise<ValetudoCustomizations | null> {
+    return { friendlyName: this.homieDevice.$name } as ValetudoCustomizations;
+  }
+  override async getRobotInfo(): Promise<ValetudoRobotInfo | null> {
+    return {
+      manufacturer: this.homieDevice.$implementation ?? '',
+      modelName: this.homieDevice.$name ?? '',
+    };
+  }
+  override async getCapabilities(): Promise<string[] | null> {
+    return this.homieDevice.$nodes?.split(',') || null;
+  }
+  override async getStateAttributes(): Promise<StateAttribute[] | null> {
+    const attributes: StateAttribute[] = [];
+    const batteryNode = this.homieDevice.nodes['BatteryStateAttribute'];
+    if (batteryNode) {
+      attributes.push({
+        __class: 'BatteryStateAttribute',
+        type: 'BatteryStateAttribute',
+        level: parseInt(batteryNode.properties['level']?.value ?? '0', 10),
+        flag: (batteryNode.properties['status']?.value ?? 'none') as BatteryFlag,
+      } as BatteryStateAttribute);
+    }
+
+    const statusNode = this.homieDevice.nodes['StatusStateAttribute'];
+    if (statusNode) {
+      attributes.push({
+        __class: 'StatusStateAttribute',
+        type: 'StatusStateAttribute',
+        value: (statusNode.properties['status']?.value ?? 'idle') as StatusStateAttributeValue,
+        flag: statusNode.properties['error_description']?.value as StatusStateAttributeFlag,
+      } as StatusStateAttribute);
+    }
+
+    return attributes.length > 0 ? attributes : null;
+  }
+  override executeBasicControl(action: 'start' | 'stop' | 'pause' | 'home'): Promise<boolean> {
+    return this.publishCommand('BasicControlCapability', 'operation', action.toUpperCase());
+  }
+  override async getFanSpeedPresets(): Promise<PresetLevel[] | null> {
+    const node = this.homieDevice.nodes['FanSpeedControlCapability'];
+    if (!node || !node.properties['preset']) return null;
+    return (node.properties['preset'].$format?.split(',') as PresetLevel[]) ?? null;
+  }
+  override setFanSpeed(preset: PresetLevel): Promise<boolean> {
+    return this.publishCommand('FanSpeedControlCapability', 'preset', preset);
+  }
+  override async getWaterUsagePresets(): Promise<PresetLevel[] | null> {
+    const node = this.homieDevice.nodes['WaterUsageControlCapability'];
+    if (!node || !node.properties['preset']) return null;
+    return (node.properties['preset'].$format?.split(',') as PresetLevel[]) ?? null;
+  }
+  override setWaterUsage(preset: PresetLevel): Promise<boolean> {
+    return this.publishCommand('WaterUsageControlCapability', 'preset', preset);
+  }
+  override async getOperationModePresets(): Promise<ValetudoOperationMode[] | null> {
+    const node = this.homieDevice.nodes['OperationModeControlCapability'];
+    if (!node || !node.properties['preset']) return null;
+    return (node.properties['preset'].$format?.split(',') as ValetudoOperationMode[]) ?? null;
+  }
+  override setOperationMode(preset: ValetudoOperationMode): Promise<boolean> {
+    return this.publishCommand('OperationModeControlCapability', 'preset', preset);
+  }
+  override async getMapSegments(): Promise<MapSegment[] | null> {
+    const node = this.homieDevice.nodes['MapData'];
+    if (!node || !node.properties['segments'] || !node.properties['segments'].value) return null;
+    try {
+      const rawSegments = JSON.parse(node.properties['segments'].value) as Record<string, string>;
+      return Object.entries(rawSegments).map(([id, name]) => ({
+        __class: 'ValetudoMapSegment',
+        id: id,
+        name: name,
+        metaData: {},
+      }));
+    } catch (error) {
+      this.log.error(`Failed to parse MapSegments: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  }
+  override getMapSegmentationProperties(): Promise<MapSegmentationProperties | null> {
+    // No mqtt endpoint for this
+    return Promise.resolve(null);
+  }
+  override cleanSegments(segmentIds: string[], iterations: number, customOrder: boolean): Promise<boolean> {
+    const payload = {
+      action: 'start_segment_action',
+      segment_ids: segmentIds,
+      iterations,
+      customOrder,
+    };
+    this.log.debug(`cleanSegments: ${JSON.stringify(payload)}`);
+    return this.publishCommand('MapSegmentationCapability', 'clean', JSON.stringify(payload));
+  }
+  override getMapDataWithTimeout(timeoutMs: number): Promise<MapData | null> {
+    throw new Error('Method not implemented.');
+  }
+  override getMapPositionData(): Promise<MapPositionData | null> {
+    throw new Error('Method not implemented.');
+  }
+  override locate(): Promise<boolean> {
+    return this.publishCommand('LocateCapability', 'locate', 'PERFORM');
+  }
+  override getConsumables(): Promise<ValetudoConsumable[] | null> {
+    return Promise.resolve(null);
+  }
+  override getConsumablesProperties(): Promise<ConsumableProperties[] | null> {
+    return Promise.resolve(null);
+  }
+
+  private async publishCommand(nodeId: string, propertyId: string, payload: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (!this.client?.connect) {
+        this.log.error('MQTT client not connected');
+        return resolve(false);
+      }
+      const node = this.homieDevice.nodes[nodeId];
+      const property = node?.properties[propertyId];
+
+      if (!property) {
+        this.log.error(`Cannot send command. Property '${nodeId}/${propertyId}' does not exist.`);
+        return resolve(false);
+      }
+      if (property.$settable !== 'true') {
+        this.log.error(`Cannot send command. Property '${nodeId}/${propertyId}' is not settable.`);
+        return resolve(false);
+      }
+      const topic = `${this.topicPrefix}/${nodeId}/${propertyId}/set`;
+
+      this.client.publish(topic, payload, { qos: 2 }, (error) => {
+        if (error) {
+          this.log.error(`Failed to publish to ${topic}: ${error.message}`);
+          resolve(false);
+        }
+        this.log.debug(`Command sent: ${topic} -> ${payload}`);
+        resolve(true);
+      });
     });
   }
 }

@@ -24,6 +24,7 @@ import {
   ValetudoClient,
   ValetudoConsumable,
   ValetudoHttpClient,
+  ValetudoMQTTClient,
   ValetudoOperationMode,
 } from './valetudo-client.js';
 import { ValetudoDiscovery } from './valetudo-discovery.js';
@@ -33,7 +34,7 @@ import { ValetudoDiscovery } from './valetudo-discovery.js';
  */
 interface VacuumInstance {
   id: string; // systemId from Valetudo
-  ip: string;
+  ip?: string;
   name: string;
   client: ValetudoClient;
   device: RoboticVacuumCleaner | null;
@@ -60,7 +61,7 @@ interface VacuumInstance {
   initialStatePending: boolean; // Flag to set initial state on first poll
 
   // Metadata
-  source: 'mdns' | 'manual';
+  source: 'mdns' | 'manual' | 'mqtt';
   lastSeen: number;
   online: boolean;
 }
@@ -148,6 +149,9 @@ export class ValetudoPlatform extends MatterbridgeDynamicPlatform {
         clearInterval(vacuum.pollingInterval);
         vacuum.pollingInterval = null;
       }
+      if (vacuum.source === 'mqtt') {
+        vacuum.client.disconnect();
+      }
     }
 
     // Clear vacuum map
@@ -174,9 +178,57 @@ export class ValetudoPlatform extends MatterbridgeDynamicPlatform {
       }
 
       try {
-        await this.addVacuum(vacuumConfig.ip, vacuumConfig.name, 'manual', vacuumConfig.username, vacuumConfig.password);
+        await this.addHttpVacuum(vacuumConfig.ip, vacuumConfig.name, 'manual', vacuumConfig.username, vacuumConfig.password);
       } catch (error) {
         this.log.error(`Failed to add manual vacuum at ${vacuumConfig.ip}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  /**
+   * Load MQTT configured vacuums from config
+   */
+  private async loadMqttVacuums(): Promise<void> {
+    const mqttConfig = (
+      this.config as {
+        mqtt?: {
+          enabled?: boolean;
+          host: string;
+          port: number;
+          username?: string;
+          password?: string;
+          rejectUnauthorized?: boolean;
+          vacuums: Array<{ topic: string; name?: string; enabled?: boolean }>;
+        };
+      }
+    ).mqtt;
+
+    if (!mqttConfig) {
+      throw new Error('Mqtt config missing');
+    }
+
+    const mqttVacuums = mqttConfig.vacuums || [];
+
+    this.log.info(`Loading ${mqttVacuums.length} MQTT configured vacuums from broker ${mqttConfig.host}:${mqttConfig.port}`);
+
+    for (const vacuumConfig of mqttVacuums) {
+      if (vacuumConfig.enabled === false) {
+        this.log.info(`Skipping disabled MQTT vacuum topic ${vacuumConfig.topic}`);
+        continue;
+      }
+
+      try {
+        await this.addMqttVacuum(
+          vacuumConfig.topic,
+          vacuumConfig.name,
+          mqttConfig.host,
+          mqttConfig.port,
+          mqttConfig?.username,
+          mqttConfig?.password,
+          mqttConfig?.rejectUnauthorized,
+        );
+      } catch (error) {
+        this.log.error(`Failed to add MQTT vacuum topic ${vacuumConfig.topic}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   }
@@ -213,7 +265,7 @@ export class ValetudoPlatform extends MatterbridgeDynamicPlatform {
             continue;
           }
 
-          await this.addVacuum(vacuum.ip, undefined, 'mdns');
+          await this.addHttpVacuum(vacuum.ip, undefined, 'mdns');
         } catch (error) {
           this.log.error(`Failed to add discovered vacuum at ${vacuum.ip}: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -230,9 +282,9 @@ export class ValetudoPlatform extends MatterbridgeDynamicPlatform {
   }
 
   /**
-   * Add a new vacuum to the system
+   * Add a new HTTP vacuum to the system
    */
-  private async addVacuum(ip: string, customName: string | undefined, source: 'mdns' | 'manual', username?: string, password?: string): Promise<void> {
+  private async addHttpVacuum(ip: string, customName: string | undefined, source: 'mdns' | 'manual', username?: string, password?: string): Promise<void> {
     this.log.info(`Adding vacuum from ${source}: ${ip}${customName ? ` (${customName})` : ''}`);
 
     // Create Valetudo client
@@ -272,10 +324,8 @@ export class ValetudoPlatform extends MatterbridgeDynamicPlatform {
     }
 
     // Determine device name
-    let deviceName: string;
-    if (customName) {
-      deviceName = customName;
-    } else {
+    let deviceName = customName;
+    if (!deviceName) {
       const customizations = await client.getCustomizations();
       if (customizations?.friendlyName) {
         deviceName = customizations.friendlyName;
@@ -329,6 +379,72 @@ export class ValetudoPlatform extends MatterbridgeDynamicPlatform {
   }
 
   /**
+   * Add a new MQTT vacuum to the system
+   */
+  private async addMqttVacuum(
+    topic: string,
+    customName: string | undefined,
+    host: string,
+    port: number,
+    username?: string,
+    password?: string,
+    rejectUnauthorized?: boolean,
+  ): Promise<void> {
+    this.log.info(`Adding vacuum from mqtt: ${topic}${customName ? ` (${customName})` : ''}`);
+
+    const client = new ValetudoMQTTClient(this.log, host, port, topic, username, password, rejectUnauthorized);
+    const isConnected = await client.connect();
+    if (!isConnected) {
+      throw new Error(`Failed to connect to MQTT vacuum at topic ${topic}`);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    let deviceName = customName;
+    if (!deviceName) {
+      const customizations = await client.getCustomizations();
+      if (customizations?.friendlyName) {
+        deviceName = customizations.friendlyName;
+      } else {
+        deviceName = topic;
+      }
+    }
+
+    const vacuum: VacuumInstance = {
+      id: topic,
+      name: deviceName,
+      client,
+      device: null,
+      pollingInterval: null,
+      capabilities: [],
+      operationModes: [],
+      areaToSegmentMap: new Map(),
+      modeMap: new Map(),
+      selectedSegmentIds: [],
+      selectedRoomNames: [],
+      consumableMap: new Map(),
+      mapLayersCache: null,
+      mapCacheValidUntil: 0,
+      lastCurrentArea: null,
+      lastConsumablesCheck: 0,
+      lastBatteryLevel: null,
+      lastBatteryChargeState: null,
+      lastOperationalState: null,
+      lastRunMode: null,
+      initialStatePending: true,
+      source: 'mqtt',
+      lastSeen: Date.now(),
+      online: true,
+    };
+
+    this.vacuums.set(topic, vacuum);
+
+    this.log.info(`Added MQTT vacuum: ${deviceName} (topic: ${topic})`);
+
+    await this.initializeVacuum(vacuum);
+  }
+
+  /**
    * Initialize a vacuum instance (fetch capabilities, create Matter device, start polling)
    */
   private async initializeVacuum(vacuum: VacuumInstance): Promise<void> {
@@ -362,12 +478,6 @@ export class ValetudoPlatform extends MatterbridgeDynamicPlatform {
     this.log.info(`Creating Matter device for vacuum: ${vacuum.name}`);
 
     try {
-      // Fetch robot info for device details
-      const robotInfo = await vacuum.client.getRobotInfo();
-      if (!robotInfo) {
-        throw new Error('Failed to fetch robot information');
-      }
-
       // Fetch map segments (rooms/areas) if supported
       let supportedAreas:
         | Array<{
@@ -1253,6 +1363,27 @@ export class ValetudoPlatform extends MatterbridgeDynamicPlatform {
 
   private async discoverDevices() {
     this.log.info('Discovering Valetudo devices with multi-vacuum support...');
+
+    const config = this.config as {
+      mqtt?: {
+        enabled?: boolean;
+      };
+    };
+
+    const mqttModeEnabled = config.mqtt?.enabled === true;
+
+    if (mqttModeEnabled) {
+      this.log.info('MQTT mode enabled: loading MQTT vacuums only (HTTP manual + mDNS discovery disabled)');
+      await this.loadMqttVacuums();
+
+      if (this.vacuums.size === 0) {
+        this.log.error('No MQTT vacuums found! Configure mqtt.vacuums and verify broker connectivity.');
+        return;
+      }
+
+      this.log.info(`Successfully configured ${this.vacuums.size} MQTT vacuum(s)`);
+      return;
+    }
 
     // Load manually configured vacuums
     await this.loadManualVacuums();
