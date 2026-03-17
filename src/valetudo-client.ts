@@ -6,6 +6,7 @@
  */
 
 import * as http from 'node:http';
+import * as zlib from 'node:zlib';
 
 import { AnsiLogger } from 'matterbridge/logger';
 import mqtt from 'mqtt';
@@ -952,9 +953,9 @@ export class ValetudoMQTTClient extends ValetudoClient {
         resolve(true);
       });
 
-      this.client.on('message', (topic, payload) => {
+      this.client.on('message', (topic, message) => {
         this.log.debug(`Received message from ${topic}`);
-
+        const payload = topic === `${this.topicPrefix}/MapData/map-data` ? zlib.inflateSync(message) : message;
         this.parseHomieTopic(topic, payload.toString());
       });
     });
@@ -1077,18 +1078,13 @@ export class ValetudoMQTTClient extends ValetudoClient {
   override async getMapSegments(): Promise<MapSegment[] | null> {
     const node = this.homieDevice.nodes['MapData'];
     if (!node || !node.properties['segments'] || !node.properties['segments'].value) return null;
-    try {
-      const rawSegments = JSON.parse(node.properties['segments'].value) as Record<string, string>;
-      return Object.entries(rawSegments).map(([id, name]) => ({
-        __class: 'ValetudoMapSegment',
-        id: id,
-        name: name,
-        metaData: {},
-      }));
-    } catch (error) {
-      this.log.error(`Failed to parse MapSegments: ${error instanceof Error ? error.message : String(error)}`);
-      return null;
-    }
+    const rawSegments = JSON.parse(node.properties['segments'].value) as Record<string, string>;
+    return Object.entries(rawSegments).map(([id, name]) => ({
+      __class: 'ValetudoMapSegment',
+      id: id,
+      name: name,
+      metaData: {},
+    }));
   }
   override getMapSegmentationProperties(): Promise<MapSegmentationProperties | null> {
     // No mqtt endpoint for this
@@ -1104,11 +1100,26 @@ export class ValetudoMQTTClient extends ValetudoClient {
     this.log.debug(`cleanSegments: ${JSON.stringify(payload)}`);
     return this.publishCommand('MapSegmentationCapability', 'clean', JSON.stringify(payload));
   }
-  override getMapDataWithTimeout(timeoutMs: number): Promise<MapData | null> {
-    throw new Error('Method not implemented.');
+  override async getMapDataWithTimeout(timeoutMs: number = 0): Promise<MapData | null> {
+    const node = this.homieDevice.nodes['MapData'];
+    if (!node || !node.properties['map-data'] || !node.properties['map-data'].value) return null;
+    try {
+      return JSON.parse(node.properties['map-data'].value) as MapData;
+    } catch (error) {
+      this.log.error(`Error parsing map data: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
   }
-  override getMapPositionData(): Promise<MapPositionData | null> {
-    throw new Error('Method not implemented.');
+  override async getMapPositionData(): Promise<MapPositionData | null> {
+    const mapData = await this.getMapDataWithTimeout();
+    if (!mapData) {
+      this.log.info(`No map data can't get position data`);
+      return null;
+    }
+    return {
+      entities: mapData.entities,
+      metaData: mapData.metaData,
+    };
   }
   override locate(): Promise<boolean> {
     return this.publishCommand('LocateCapability', 'locate', 'PERFORM');
