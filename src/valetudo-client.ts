@@ -5,6 +5,7 @@
  * @description Client for communicating with Valetudo REST API
  */
 
+import { EventEmitter } from 'node:events';
 import * as http from 'node:http';
 import * as zlib from 'node:zlib';
 
@@ -194,19 +195,40 @@ export interface MapPositionData {
   metaData?: { version: number };
 }
 
+export interface ValetudoClientEvents {
+  battery_update: (battery: BatteryStateAttribute) => void;
+  status_update: (status: StatusStateAttribute, dockStatus?: DockStatusStateAttribute) => void;
+  map_update: (mapLayers: CachedMapLayers) => void;
+  robot_position_update: (robotEntity: MapPositionData) => void;
+  consumables_update: (consumables: ValetudoConsumable[]) => void;
+  connected: () => void;
+  disconnected: () => void;
+}
+
 // ============================================================================
 // Abstract Valetudo Client
 // ============================================================================
 
-export abstract class ValetudoClient {
+export abstract class ValetudoClient extends EventEmitter {
   protected log: AnsiLogger;
 
   constructor(log: AnsiLogger) {
+    super();
     this.log = log;
   }
 
+  override emit<K extends keyof ValetudoClientEvents>(eventName: K, ...args: Parameters<ValetudoClientEvents[K]>): boolean {
+    return super.emit(eventName, ...args);
+  }
+  override on<K extends keyof ValetudoClientEvents>(eventName: K, listener: ValetudoClientEvents[K]): this {
+    return super.on(eventName, listener);
+  }
+
+  // ==========================================================================
+  // Lifecycle
+  // ==========================================================================
   abstract connect(): Promise<boolean>;
-  abstract disconnect(): Promise<void>;
+  abstract disconnect(): void;
 
   // ==========================================================================
   // General Information
@@ -372,12 +394,36 @@ export abstract class ValetudoClient {
 // ============================================================================
 
 export class ValetudoHttpClient extends ValetudoClient {
+  private stateInterval: NodeJS.Timeout | null = null;
+  private consumablesInterval: NodeJS.Timeout | null = null;
+  private mapInterval: NodeJS.Timeout | null = null;
+
+  private statePollRate = 30 * 1000;
+  private consumablePollRate = 30 * 1000;
+  private mapPollRate = 60 * 30 * 1000;
+
+  private positionTracking: boolean = true;
   private baseUrl: string;
   private authHeader: string | null = null;
 
-  constructor(ip: string, log: AnsiLogger, username?: string, password?: string) {
+  constructor(
+    ip: string,
+    log: AnsiLogger,
+    username?: string,
+    password?: string,
+    positionTracking = true,
+    statePollRate = 30 * 1000,
+    consumablePollRate = 30 * 1000,
+    mapPollRate = 60 * 30 * 1000,
+  ) {
     super(log);
     this.baseUrl = `http://${ip}`;
+
+    this.positionTracking = positionTracking;
+
+    this.statePollRate = statePollRate;
+    this.consumablePollRate = consumablePollRate;
+    this.mapPollRate = mapPollRate;
 
     // Pre-compute Base64 Authorization header if credentials are provided
     if (username && password) {
@@ -386,11 +432,67 @@ export class ValetudoHttpClient extends ValetudoClient {
   }
 
   override async connect(): Promise<boolean> {
-    return this.testConnection();
+    if (!this.testConnection()) return false;
+
+    this.emit('connected');
+
+    await this.updateState();
+    this.stateInterval = setInterval(() => this.updateState(), this.statePollRate);
+
+    await this.updateMapCache();
+    this.mapInterval = setInterval(() => this.updateMapCache(), this.mapPollRate);
+
+    await this.updateConsumables();
+    this.consumablesInterval = setInterval(() => this.updateConsumables(), this.consumablePollRate);
+
+    return true;
   }
 
-  override async disconnect(): Promise<void> {
-    return;
+  override disconnect(): void {
+    if (this.stateInterval) clearInterval(this.stateInterval);
+    this.emit('disconnected');
+  }
+
+  private async updateState() {
+    try {
+      const attributes = await this.getStateAttributes();
+      if (!attributes) {
+        this.log.warn(`Failed to fetch state attributes`);
+        return;
+      }
+      const battery = attributes.find((attr) => attr.__class === 'BatteryStateAttribute') as BatteryStateAttribute;
+      if (battery) {
+        this.emit('battery_update', battery);
+      }
+
+      const statusAttr = attributes.find((attr) => attr.__class === 'StatusStateAttribute') as StatusStateAttribute;
+      const dockStatus = attributes.find((attr) => attr.__class === 'DockStatusStateAttribute') as DockStatusStateAttribute;
+      if (statusAttr || dockStatus) {
+        this.emit('status_update', statusAttr, dockStatus);
+      }
+
+      if (this.positionTracking) {
+        const positionData = await this.getMapPositionData();
+        if (positionData) {
+          this.emit('robot_position_update', positionData);
+        }
+      }
+    } catch {
+      this.emit('disconnected');
+    }
+  }
+
+  private async updateConsumables() {
+    const consumables = await this.getConsumables();
+    if (!consumables) return;
+    this.emit('consumables_update', consumables);
+  }
+
+  private async updateMapCache() {
+    const mapData = await this.getMapDataWithTimeout(60000);
+    if (!mapData) return;
+    const mapLayersCache = this.createCachedLayers(mapData);
+    this.emit('map_update', mapLayersCache);
   }
 
   // ==========================================================================
@@ -946,17 +1048,19 @@ export class ValetudoMQTTClient extends ValetudoClient {
   override async connect(): Promise<boolean> {
     return new Promise((resolve) => {
       this.client = mqtt.connect(this.brokerUrl, this.options);
-
       this.client.on('connect', () => {
-        this.log.info(`Connected to MQTT Broker at ${this.brokerUrl}. Subscribing to ${this.topicPrefix}/#`);
-        this.client?.subscribe(`${this.topicPrefix}/#`);
+        this.log.info(`Connected to MQTT Broker at ${this.brokerUrl}. Subscribing to ${this.topicPrefix}/$state`);
+        this.client?.subscribe(`${this.topicPrefix}/$state`);
         resolve(true);
       });
 
       this.client.on('message', (topic, message) => {
         this.log.debug(`Received message from ${topic}`);
-        const payload = topic === `${this.topicPrefix}/MapData/map-data` ? zlib.inflateSync(message) : message;
-        this.parseHomieTopic(topic, payload.toString());
+        this.parseHomieTopic(topic, message);
+      });
+
+      this.client.on('close', () => {
+        this.emit('disconnected');
       });
     });
   }
@@ -965,13 +1069,20 @@ export class ValetudoMQTTClient extends ValetudoClient {
     this.client?.end();
   }
 
-  private parseHomieTopic(topic: string, payload: string) {
+  private parseHomieTopic(topic: string, payload: Buffer) {
     const path = topic.substring(this.topicPrefix.length + 1);
     const parts = path.split('/');
+    const message = (topic === `${this.topicPrefix}/MapData/map-data` ? zlib.inflateSync(payload) : payload).toString();
 
     if (parts.length === 1 && parts[0].startsWith('$')) {
       const attr = parts[0] as keyof HomieDevice;
-      (this.homieDevice[attr] as string) = payload;
+      (this.homieDevice[attr] as string) = message;
+      if (attr === '$state' && message === 'ready') {
+        this.log.info(`Device ready. Subscribing to ${this.topicPrefix}/#`);
+        this.client?.unsubscribe(`${this.topicPrefix}/$state`);
+        this.client?.subscribe(`${this.topicPrefix}/#`);
+        this.emit('connected');
+      }
       return;
     }
     const nodeId = parts[0];
@@ -985,7 +1096,7 @@ export class ValetudoMQTTClient extends ValetudoClient {
 
     if (propertyId && propertyId.startsWith('$')) {
       const attr = propertyId as keyof HomieNode;
-      (node[attr] as string) = payload;
+      (node[attr] as string) = message;
       return;
     }
 
@@ -997,9 +1108,61 @@ export class ValetudoMQTTClient extends ValetudoClient {
 
       if (attributeId && attributeId.startsWith('$')) {
         const attr = attributeId as keyof HomieProperty;
-        (property[attr] as string) = payload;
+        (property[attr] as string) = message;
       } else if (!attributeId) {
-        property.value = payload;
+        this.handlePropertyValue(nodeId, propertyId, message);
+      }
+    }
+  }
+
+  private handlePropertyValue(nodeId: string, propertyId: string, message: string): void {
+    const node = this.homieDevice.nodes[nodeId];
+    const property = node.properties[propertyId];
+    if (nodeId === 'BatteryStateAttribute') {
+      property.value = message;
+      if (!node.properties['level'] || !node.properties['flag']) return;
+
+      const battery = {
+        level: parseInt(node.properties['level'].value ?? '0'),
+        flag: (node.properties['flag'].value ?? 'none') as BatteryFlag,
+      } as BatteryStateAttribute;
+      this.emit('battery_update', battery);
+      return;
+    }
+
+    if (nodeId === 'StatusStateAttribute' || nodeId === 'DockStatusStateAttribute') {
+      property.value = message;
+
+      const statusNode = this.homieDevice.nodes['StatusStateAttribute'];
+      const status = { value: statusNode.properties['status'].value } as StatusStateAttribute;
+
+      const dockNode = this.homieDevice.nodes['DockStatusStateAttribute'];
+      const dockStatus = dockNode
+        ? ({
+            value: dockNode.properties['status'].value,
+          } as DockStatusStateAttribute)
+        : undefined;
+      this.emit('status_update', status, dockStatus);
+      return;
+    }
+
+    if (nodeId === 'MapData') {
+      if (propertyId === 'map-data') {
+        try {
+          const mapData = JSON.parse(message) as MapData;
+          const positionData = { entities: mapData.entities, metaData: mapData.metaData } as MapPositionData;
+          this.emit('robot_position_update', positionData);
+
+          const mapLayersCache = this.createCachedLayers(mapData);
+          this.emit('map_update', mapLayersCache);
+          return;
+        } catch (error) {
+          this.log.error(`Error parsing map data: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      if (propertyId === 'segments') {
+        property.value = message;
+        return;
       }
     }
   }
@@ -1017,36 +1180,17 @@ export class ValetudoMQTTClient extends ValetudoClient {
   }
   override async getRobotInfo(): Promise<ValetudoRobotInfo | null> {
     return {
-      manufacturer: this.homieDevice.$implementation ?? '',
-      modelName: this.homieDevice.$name ?? '',
-    };
+      manufacturer: this.homieDevice.$implementation,
+      modelName: this.homieDevice.$name,
+    } as ValetudoRobotInfo;
   }
   override async getCapabilities(): Promise<string[] | null> {
+    // Will return more than just "capabilites" but we will only use it to check if they are present.
     return this.homieDevice.$nodes?.split(',') || null;
   }
   override async getStateAttributes(): Promise<StateAttribute[] | null> {
-    const attributes: StateAttribute[] = [];
-    const batteryNode = this.homieDevice.nodes['BatteryStateAttribute'];
-    if (batteryNode) {
-      attributes.push({
-        __class: 'BatteryStateAttribute',
-        type: 'BatteryStateAttribute',
-        level: parseInt(batteryNode.properties['level']?.value ?? '0', 10),
-        flag: (batteryNode.properties['status']?.value ?? 'none') as BatteryFlag,
-      } as BatteryStateAttribute);
-    }
-
-    const statusNode = this.homieDevice.nodes['StatusStateAttribute'];
-    if (statusNode) {
-      attributes.push({
-        __class: 'StatusStateAttribute',
-        type: 'StatusStateAttribute',
-        value: (statusNode.properties['status']?.value ?? 'idle') as StatusStateAttributeValue,
-        flag: statusNode.properties['error_description']?.value as StatusStateAttributeFlag,
-      } as StatusStateAttribute);
-    }
-
-    return attributes.length > 0 ? attributes : null;
+    // This shouldn't be called
+    throw new Error('Method not implemented.');
   }
   override executeBasicControl(action: 'start' | 'stop' | 'pause' | 'home'): Promise<boolean> {
     return this.publishCommand('BasicControlCapability', 'operation', action.toUpperCase());
@@ -1084,7 +1228,7 @@ export class ValetudoMQTTClient extends ValetudoClient {
       id: id,
       name: name,
       metaData: {},
-    }));
+    })) as MapSegment[];
   }
   override getMapSegmentationProperties(): Promise<MapSegmentationProperties | null> {
     // No mqtt endpoint for this
@@ -1101,39 +1245,26 @@ export class ValetudoMQTTClient extends ValetudoClient {
     return this.publishCommand('MapSegmentationCapability', 'clean', JSON.stringify(payload));
   }
   override async getMapDataWithTimeout(timeoutMs: number = 0): Promise<MapData | null> {
-    const node = this.homieDevice.nodes['MapData'];
-    if (!node || !node.properties['map-data'] || !node.properties['map-data'].value) return null;
-    try {
-      return JSON.parse(node.properties['map-data'].value) as MapData;
-    } catch (error) {
-      this.log.error(`Error parsing map data: ${error instanceof Error ? error.message : String(error)}`);
-      return null;
-    }
+    // This shouldn't be called
+    throw new Error('Method not implemented.');
   }
   override async getMapPositionData(): Promise<MapPositionData | null> {
-    const mapData = await this.getMapDataWithTimeout();
-    if (!mapData) {
-      this.log.info(`No map data can't get position data`);
-      return null;
-    }
-    return {
-      entities: mapData.entities,
-      metaData: mapData.metaData,
-    };
+    // This shouldn't be called
+    throw new Error('Method not implemented.');
   }
   override locate(): Promise<boolean> {
     return this.publishCommand('LocateCapability', 'locate', 'PERFORM');
   }
-  override getConsumables(): Promise<ValetudoConsumable[] | null> {
-    return Promise.resolve(null);
+  override async getConsumables(): Promise<ValetudoConsumable[] | null> {
+    return null;
   }
-  override getConsumablesProperties(): Promise<ConsumableProperties[] | null> {
-    return Promise.resolve(null);
+  override async getConsumablesProperties(): Promise<ConsumableProperties[] | null> {
+    return null;
   }
 
   private async publishCommand(nodeId: string, propertyId: string, payload: string): Promise<boolean> {
     return new Promise((resolve) => {
-      if (!this.client?.connect) {
+      if (!this.client?.connected) {
         this.log.error('MQTT client not connected');
         return resolve(false);
       }
